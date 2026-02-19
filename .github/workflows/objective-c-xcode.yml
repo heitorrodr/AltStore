@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-ipa:
-    runs-on: macos-latest
+    runs-on: macos-15
 
     env:
       SCHEME: AltStore
@@ -27,8 +27,22 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      - name: Show Xcode version
-        run: xcodebuild -version
+      - name: Select latest Xcode installed on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Available Xcodes:"
+          ls -la /Applications | grep -i xcode || true
+          XCODE_APP="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1)"
+          if [ -z "${XCODE_APP:-}" ]; then
+            echo "❌ No Xcode*.app found in /Applications"
+            ls -la /Applications
+            exit 1
+          fi
+          echo "Using: $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          xcode-select -p
 
       - name: Detect workspace/project
         shell: bash
@@ -44,6 +58,58 @@ jobs:
           echo "Filetype: $(cat filetype)"
           echo "File: $(cat file)"
           echo "Scheme forced: $SCHEME"
+
+      - name: Create AppIcon if missing (GitHub-only friendly)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Try to locate an asset catalog used by AltStore
+          ASSETS="$(find . -maxdepth 6 -type d -name "*.xcassets" \
+            | grep -E "AltStore/Resources/(Assets|Icons)\.xcassets$" \
+            | head -n 1 || true)"
+
+          if [ -z "$ASSETS" ]; then
+            echo "❌ Could not find AltStore asset catalog. Listing xcassets:"
+            find . -maxdepth 6 -type d -name "*.xcassets" -print
+            exit 1
+          fi
+
+          echo "✅ Using asset catalog: $ASSETS"
+
+          ICONSET="$ASSETS/AppIcon.appiconset"
+          if [ -d "$ICONSET" ]; then
+            echo "✅ AppIcon.appiconset already exists, skipping."
+            exit 0
+          fi
+
+          mkdir -p "$ICONSET"
+
+          # Generate a 1024x1024 PNG icon from macOS built-in GenericApplicationIcon
+          FALLBACK="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns"
+          if [ -f "$FALLBACK" ]; then
+            sips -s format png "$FALLBACK" --out "$ICONSET/icon-1024.png" >/dev/null
+            sips -z 1024 1024 "$ICONSET/icon-1024.png" >/dev/null
+          else
+            # Shouldn't happen on macOS runners, but keep a fallback
+            python3 - << 'PY'
+from PIL import Image
+Image.new("RGBA",(1024,1024),(255,255,255,255)).save("icon-1024.png")
+PY
+            mv icon-1024.png "$ICONSET/icon-1024.png"
+          fi
+
+          cat > "$ICONSET/Contents.json" << 'JSON'
+{
+  "images": [
+    { "idiom": "ios-marketing", "size": "1024x1024", "scale": "1x", "filename": "icon-1024.png" }
+  ],
+  "info": { "author": "xcode", "version": 1 }
+}
+JSON
+
+          echo "✅ Created dummy AppIcon at: $ICONSET"
+          ls -la "$ICONSET"
 
       - name: List schemes (debug)
         shell: bash
@@ -83,12 +149,10 @@ jobs:
             | head -n 1 || true)"
 
           if [ -z "$APP_PATH" ]; then
-            echo "❌ Could not find built .app in build/Build/Products/${CONFIGURATION}-iphoneos"
+            echo "❌ Could not find built .app"
             find build/Build/Products -maxdepth 4 -type d -name "*.app" -print || true
             exit 1
           fi
-
-          echo "✅ APP_PATH=$APP_PATH"
 
           rm -rf Payload dist
           mkdir -p Payload dist
