@@ -1,4 +1,4 @@
-name: Xcode - Build and Analyze
+name: Build IPA (unsigned)
 
 on:
   push:
@@ -7,12 +7,11 @@ on:
     branches: [ "marketplace" ]
 
 jobs:
-  build:
-    name: Build and analyse default scheme using xcodebuild command
+  build-ipa:
     runs-on: macos-latest
 
     steps:
-      - name: Checkout (with submodules + LFS)
+      - name: Checkout (submodules + LFS)
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -24,43 +23,76 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      - name: Verify OpenSSL.xcframework exists (debug)
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Detect scheme + workspace/project
+        shell: bash
         run: |
-          ls -la AltStore/Dependencies/AltSign/Dependencies/OpenSSL/Frameworks || true
-          ls -la Dependencies/AltSign/Dependencies/OpenSSL/Frameworks || true
-          find . -maxdepth 6 -type d -name "OpenSSL.xcframework" -print || true
+          set -euo pipefail
 
-      - name: Set Default Scheme
-        run: |
-          scheme_list=$(xcodebuild -list -json | tr -d "\n")
-          default=$(echo "$scheme_list" | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-          echo "$default" > default
-          echo "Using default scheme: $default"
-
-      - name: Build
-        env:
-          scheme: default
-        run: |
-          set -eo pipefail
-
-          if [ "$scheme" = "default" ]; then
-            scheme=$(cat default)
-          fi
-
+          # Pick workspace or project
           if ls -A | grep -qiE '\.xcworkspace$'; then
-            filetype_parameter="workspace"
-            file_to_build="$(ls -A | grep -iE '\.xcworkspace$' | head -n 1)"
+            echo "workspace" > filetype
+            ls -A | grep -iE '\.xcworkspace$' | head -n 1 > file
           else
-            filetype_parameter="project"
-            file_to_build="$(ls -A | grep -iE '\.xcodeproj$' | head -n 1)"
+            echo "project" > filetype
+            ls -A | grep -iE '\.xcodeproj$' | head -n 1 > file
           fi
 
-          file_to_build="$(echo "$file_to_build" | awk '{$1=$1;print}')"
+          echo "Filetype: $(cat filetype)"
+          echo "File: $(cat file)"
 
-          echo "Building scheme: $scheme"
-          echo "Building $filetype_parameter: $file_to_build"
+          # Try to detect a default scheme (same logic you had)
+          scheme_list=$(xcodebuild -list -json -"$(cat filetype)" "$(cat file)" | tr -d "\n")
+          default=$(echo "$scheme_list" | ruby -e "require 'json'; j=JSON.parse(STDIN.gets); puts (j['workspace'] && j['workspace']['schemes'] && j['workspace']['schemes'][0]) || (j['project']['schemes'] && j['project']['schemes'][0]) || (j['project']['targets'] && j['project']['targets'][0])")
+          echo "$default" > scheme
+          echo "Scheme: $(cat scheme)"
 
-          xcodebuild clean build analyze \
-            -scheme "$scheme" \
-            -"$filetype_parameter" "$file_to_build" \
+      - name: Build for iPhoneOS (no signing) + Package IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILETYPE=$(cat filetype)
+          FILE=$(cat file)
+          SCHEME=$(cat scheme)
+
+          # Build for device (iphoneos). No signing to avoid cert/provision in CI.
+          xcodebuild clean build \
+            -"$FILETYPE" "$FILE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             | xcpretty
+
+          # Find the built .app
+          APP_PATH="$(find build/Build/Products -maxdepth 2 -type d -name "*.app" | grep -E "Release-iphoneos/.*\.app$" | head -n 1 || true)"
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ Could not find built .app in build/Build/Products/Release-iphoneos"
+            find build/Build/Products -maxdepth 4 -type d -name "*.app" -print || true
+            exit 1
+          fi
+          echo "✅ APP_PATH=$APP_PATH"
+
+          # Package into an IPA (Payload/<App>.app)
+          rm -rf Payload dist
+          mkdir -p Payload dist
+          cp -R "$APP_PATH" Payload/
+
+          IPA_NAME="${SCHEME}-unsigned.ipa"
+          (cd . && /usr/bin/zip -r "dist/$IPA_NAME" Payload >/dev/null)
+
+          echo "✅ Created dist/$IPA_NAME"
+          ls -la dist
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa
+          path: dist/*.ipa
