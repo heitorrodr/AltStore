@@ -2,11 +2,9 @@ name: Build IPA (unsigned) - AltStore
 
 on:
   push:
-    branches:
-      - marketplace
+    branches: [ "marketplace" ]
   pull_request:
-    branches:
-      - marketplace
+    branches: [ "marketplace" ]
 
 jobs:
   build-ipa:
@@ -25,74 +23,74 @@ jobs:
           fetch-depth: 0
 
       - name: Ensure submodules are initialized
+        shell: bash
         run: |
+          set -euo pipefail
           git submodule sync --recursive
           git submodule update --init --recursive
 
-      - name: Select latest Xcode installed on runner
+      - name: Select newest Xcode (prefer 26.x)
+        shell: bash
         run: |
           set -euo pipefail
           echo "Available Xcodes:"
           ls -la /Applications | grep -i xcode || true
-          XCODE_APP=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -n 1)
+
+          XCODE_APP="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
           if [ -z "${XCODE_APP:-}" ]; then
-            echo "No Xcode*.app found in /Applications"
+            XCODE_APP="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+
+          if [ -z "${XCODE_APP:-}" ]; then
+            echo "❌ No Xcode_*.app found"
             exit 1
           fi
-          echo "Using: $XCODE_APP"
+
+          echo "✅ Using: $XCODE_APP"
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
           xcodebuild -version
           xcode-select -p
 
       - name: Detect workspace or project
+        shell: bash
         run: |
           set -euo pipefail
           if ls -A | grep -qi ".xcworkspace$"; then
-            echo workspace > filetype
+            echo "workspace" > filetype
             ls -A | grep -i ".xcworkspace$" | head -n 1 > file
           else
-            echo project > filetype
+            echo "project" > filetype
             ls -A | grep -i ".xcodeproj$" | head -n 1 > file
           fi
           echo "Filetype: $(cat filetype)"
           echo "File: $(cat file)"
-          echo "Scheme: $SCHEME"
 
       - name: Create AppIcon if missing (CI workaround)
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Locate an xcassets directory (prefer AltStore Resources if present)
-          ASSETS=$(find . -maxdepth 6 -type d -name "*.xcassets" | grep "AltStore/Resources" | head -n 1 || true)
+          ASSETS="$(find . -maxdepth 6 -type d -name "*.xcassets" | grep "AltStore/Resources" | head -n 1 || true)"
           if [ -z "${ASSETS:-}" ]; then
-            ASSETS=$(find . -maxdepth 6 -type d -name "*.xcassets" | head -n 1 || true)
+            ASSETS="$(find . -maxdepth 6 -type d -name "*.xcassets" | head -n 1 || true)"
           fi
-
           if [ -z "${ASSETS:-}" ]; then
-            echo "No .xcassets found"
+            echo "❌ No .xcassets found"
             exit 1
           fi
 
-          echo "Using asset catalog: $ASSETS"
-
           ICONSET="$ASSETS/AppIcon.appiconset"
           if [ -d "$ICONSET" ]; then
-            echo "AppIcon already exists, skipping."
+            echo "✅ AppIcon exists, skipping."
             exit 0
           fi
 
           mkdir -p "$ICONSET"
-
           FALLBACK="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns"
-          if [ -f "$FALLBACK" ]; then
-            sips -s format png "$FALLBACK" --out "$ICONSET/icon-1024.png" >/dev/null
-            sips -z 1024 1024 "$ICONSET/icon-1024.png" >/dev/null
-          else
-            echo "Fallback icon not found, cannot generate icon."
-            exit 1
-          fi
+          sips -s format png "$FALLBACK" --out "$ICONSET/icon-1024.png" >/dev/null
+          sips -z 1024 1024 "$ICONSET/icon-1024.png" >/dev/null
 
-          cat > "$ICONSET/Contents.json" << 'JSON'
+          cat > "$ICONSET/Contents.json" <<'JSON'
           {
             "images": [
               {
@@ -104,18 +102,16 @@ jobs:
             ],
             "info": { "author": "xcode", "version": 1 }
           }
-          JSON
-
-          echo "Created AppIcon at: $ICONSET"
-          ls -la "$ICONSET"
+JSON
 
       - name: Build for iPhoneOS (no signing)
+        shell: bash
         run: |
           set -euo pipefail
-          FILETYPE=$(cat filetype)
-          FILE=$(cat file)
 
-          # If xcpretty is not available, fall back to raw xcodebuild output
+          FILETYPE="$(cat filetype)"
+          FILE="$(cat file)"
+
           if command -v xcpretty >/dev/null 2>&1; then
             xcodebuild clean build \
               -"$FILETYPE" "$FILE" \
@@ -142,12 +138,13 @@ jobs:
           fi
 
       - name: Package unsigned IPA
+        shell: bash
         run: |
           set -euo pipefail
 
-          APP_PATH=$(find build/Build/Products -type d -name "*.app" | grep "/${CONFIGURATION}-iphoneos/" | head -n 1 || true)
+          APP_PATH="$(find build/Build/Products -type d -name "*.app" | grep "/${CONFIGURATION}-iphoneos/" | head -n 1 || true)"
           if [ -z "${APP_PATH:-}" ]; then
-            echo "Could not find built .app"
+            echo "❌ Could not find built .app"
             find build/Build/Products -maxdepth 4 -type d -name "*.app" -print || true
             exit 1
           fi
@@ -159,7 +156,7 @@ jobs:
           IPA_NAME="${SCHEME}-unsigned.ipa"
           /usr/bin/zip -r "dist/$IPA_NAME" Payload >/dev/null
 
-          echo "Created dist/$IPA_NAME"
+          echo "✅ Created dist/$IPA_NAME"
           ls -la dist
 
       - name: Upload IPA artifact
